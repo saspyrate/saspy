@@ -209,6 +209,11 @@ class SASconfigSTDIO:
          except:
             pass
 
+      self.cancel_messages = [
+         b"ERROR: Execution canceled by an %ABORT CANCEL",
+         b"ERROR: Execution terminated by an ABORT CANCEL"
+      ]
+
       return
 
 class SASsessionSTDIO():
@@ -317,6 +322,8 @@ Will use HTML5 for this SASsession.""")
    def _startsas(self):
       if self.pid:
          return self.pid
+
+      self._canceled = False
 
       pgm, parms = self._buildcommand(self.sascfg)
 
@@ -479,6 +486,11 @@ Will use HTML5 for this SASsession.""")
          self.stdin.write(self.q_stdin.get())
          self.stdin.flush()
          self.q_stdin.task_done()
+
+   def _process_log_line(self, line):
+     if any(line.startswith(msg) for msg in self.sascfg.cancel_messages):
+       self._canceled = True
+       warnings.warn("SAS process was canceled.")
 
    def _endsas(self):
       rc  = 0
@@ -834,6 +846,7 @@ Will use HTML5 for this SASsession.""")
 
       self.q_stdin.put(pgm)
 
+      log_processor = LineProcessor(self._process_log_line, self._process_log_line)
       bof = False
       while not done:
          try:
@@ -897,8 +910,12 @@ Will use HTML5 for this SASsession.""")
                      logf += log
                      wait = False
 
+                     log_processor.handle(log)
+                     if self._canceled:
+                       logf += b"\n" + logcodeo
+
                   if not bail and logf.count(logcodeo) >= 1:
-                      if ods:
+                      if not self._canceled and ods:
                          lenf = len(lstf)
                          if lenf > 20 and bof:
                             if lstf.count(b"</html>"):
@@ -964,6 +981,9 @@ Will use HTML5 for this SASsession.""")
             self._sb.SASpid = None
             log = logf.partition(logcodeo)[0]+b'\nConnection Reset: SAS process has terminated unexpectedly. Pid State= '+str(rc).encode()+b'\n'+logf
             return dict(LOG=log.encode(), LST='')
+
+      if self._canceled:
+        self._endsas()
 
       if ods:
          try:
@@ -2749,3 +2769,21 @@ class _read_sock(io.StringIO):
       self.datar  = data[2]
 
       return datap.decode()
+
+class LineProcessor:
+  def __init__(self, line_handler, incomplete_line_handler, delim=b'\n'):
+    self.line_handler = line_handler
+    self.incomplete_line_handler = incomplete_line_handler
+    self.delim = delim
+    self.last_incomplete_line = b''
+
+  def handle(self, data):
+    data, _, incomplete_line = data.rpartition(self.delim)
+    lines = data.split(self.delim)
+    lines[0] = self.last_incomplete_line + lines[0]
+    if self.line_handler:
+      for line in lines:
+        self.line_handler(line)
+    if self.incomplete_line_handler:
+      self.incomplete_line_handler(incomplete_line)
+    self.last_incomplete_line = incomplete_line
